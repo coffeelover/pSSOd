@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl -w
+#!/usr/bin/perl -W
 package SSOD;
 
 # Provides a SSO Daemon to enable password synchronization between
@@ -7,25 +7,38 @@ package SSOD;
 # ZeWaren / Erwan Martin <public@fzwte.net>, http://zewaren.net
 # License: MIT
 
-use constant SSOD_SECRET => "8MRQH_Pa62637f3fG]3T";
-use constant SSOD_TCP_HOST => "192.168.42.20";
-use constant SSOD_TCP_PORT => 6677;
-use constant SSOD_DEBUG_MODE => 0;
-
 use strict;
 use warnings;
 
-if (!SSOD_DEBUG_MODE) {
-    use base qw(Net::Server::Fork);
-}
-else {
-    use IO::Socket::INET;
-}
 use Digest::SHA1  qw(sha1 sha1_hex sha1_base64);
 use Crypt::ECB;
 use Crypt::DES;
 use MIME::Base64 qw(encode_base64);
 use Log::Log4perl;
+use Net::LDAP;
+use Net::LDAP::Entry;
+use Config::File;
+
+# Check config every 60 secs
+Log::Log4perl::init_and_watch('/etc/pssod/log4perl.conf', 60);
+my $log = Log::Log4perl->get_logger("pSSOd");
+my $config= Config::File::read_config_file('/etc/pssod/pssod.conf');
+
+my $ssod_secret=     $config->{'ssod_secret'};
+my $ssod_tcp_host=   $config->{'ssod_tcp_host'};
+my $ssod_tcp_port=   $config->{'ssod_tcp_port'};
+my $ssod_debug_mode= $config->{'ssod_debug_mode'};
+my $ldap_uri=        $config->{'ldap_uri'};
+my $ldap_base=       $config->{'ldap_base'};
+my $ldap_rootdn=     $config->{'ldap_rootdn'};
+my $ldap_rootpw=     $config->{'ldap_rootpw'};
+
+if (!$ssod_debug_mode) {
+    use base qw(Net::Server::Fork);
+}
+else {
+    use IO::Socket::INET;
+}
 
 require perlssod_deskey;
 
@@ -63,8 +76,7 @@ use constant LAST_ERROR_NUMBER => 25;
 sub data_received_callback {
     my ($username, $password) = @_;
 
-    my $logger = Log::Log4perl->get_logger();
-    $logger->info(sprintf("Inside callback with user %s and password %s.", $username, $password));
+    $log->info(sprintf("Inside callback with user %s and password %s.", $username, $password));
     return 1;
 }
 
@@ -167,23 +179,22 @@ sub triple_des_ssod {
 #
 sub handle_request {
     my ($client_socket) = @_;
-    my $logger = Log::Log4perl->get_logger();
 
     binmode $client_socket;
 
-    $logger->debug("Sending random string.");
+    $log->debug("Sending random string.");
     my @r1 = ();
     push @r1, int(rand(255)) for (0..7);
     my $r1 = pack('C*', @r1);
     print $client_socket pack("A8", $r1);
 
-    $logger->debug("Reading packet.");
+    $log->debug("Reading packet.");
     my ($buffer, $version, $message_size, $message);
     read $client_socket, $buffer, 4;
     $version = unpack('N', $buffer);
 
     if ($version != 0) {
-        $logger->error("Packet version is unsuported.");
+        $log->error("Packet version is unsuported.");
         return ERROR_VERSION_NOT_SUPPORTED;
     }
 
@@ -195,11 +206,11 @@ sub handle_request {
 
     my( $message_type, $r2, $string ) = unpack( 'N A8 A*', $buffer );
 
-    $logger->debug("Computing key.");
-    my $h = make_hash $r1, $r2, SSOD_SECRET;
+    $log->debug("Computing key.");
+    my $h = make_hash $r1, $r2, $ssod_secret;
     my $key = extend_hash_for_key( $h );
 
-    $logger->debug("Decrypting buffer.");
+    $log->debug("Decrypting buffer.");
     my $count = 0;
     my $decrypted_buffer = '';
     while($count < length($string)) {
@@ -209,7 +220,7 @@ sub handle_request {
 
     my ($username, $password, $message_check_data) = split(/\0/, $decrypted_buffer);
 
-    $logger->debug("Checking packet checksum.");
+    $log->debug("Checking packet checksum.");
     my @DESTable1 = des_get_key_table(substr($key, 0, 8));
     my @DESTable2 = des_get_key_table(substr($key, 8, 16));
     my @DESTable3 = des_get_key_table(substr($key, 16, 24));
@@ -223,11 +234,11 @@ sub handle_request {
     my $message_check_calculated = generate_hash_for_verification(pack('L*', @DES3Table), $version, $message_size, $message_type, $username, $password);
 
     if (!(encode_base64($message_check_calculated) eq encode_base64($message_check_data))) {
-        $logger->error(sprintf("Error decrypting packet."));
+        $log->error(sprintf("Error decrypting packet."));
         return ERROR_DECRYPTING;
     }
 
-    $logger->info(sprintf("Calling callback with user %s.", $username));
+    $log->info(sprintf("Calling callback with user %s.", $username));
     my $res = data_received_callback($username, $password);
     return ERROR_UPDATE_PASSWORD_FILE if (!$res);
     return ERROR_SUCCESS;
@@ -239,10 +250,9 @@ sub handle_request {
 sub process_request {
     my $self = shift;
     my $socket = $self->{server}->{client};
-    my $logger = Log::Log4perl->get_logger();
 
     my $error = handle_request($socket);
-    $logger->debug(sprintf("Error is %d", $error));
+    $log->debug(sprintf("Error is %d", $error));
 
     my $version_number = 0;
     my $message_type = 1;
@@ -255,38 +265,17 @@ sub process_request {
 #
 # let's rock
 #
-if (!SSOD_DEBUG_MODE) {
-    my $log_conf = q(
-        log4perl.rootLogger              = INFO, LOGFILE
-        log4perl.appender.LOGFILE           = Log::Log4perl::Appender::File
-        log4perl.appender.LOGFILE.filename  = /var/log/pssod.log
-        log4perl.appender.LOGFILE.mode      = append
-        log4perl.appender.LOGFILE.layout    = Log::Log4perl::Layout::PatternLayout
-        log4perl.appender.LOGFILE.layout.ConversionPattern = %d %p %m %n
-    );
-    Log::Log4perl::init(\$log_conf);
-    my $logger = Log::Log4perl->get_logger();
-
-    $logger->info("Starting pSSOd.");
-    SSOD->run(host => SSOD_TCP_HOST, port => SSOD_TCP_PORT, ipv => '4');
+if (!$ssod_debug_mode) {
+    $log->info("Starting pSSOd.");
+    SSOD->run(host => $ssod_tcp_host, port => $ssod_tcp_port, ipv => '4');
 }
 else {
     #Single connection version. Useful for debugging.
-    my $log_conf = q(
-        log4perl.rootLogger              = INFO, SCREEN
-        log4perl.appender.SCREEN         = Log::Log4perl::Appender::Screen
-        log4perl.appender.SCREEN.stderr  = 0
-        log4perl.appender.SCREEN.layout  = Log::Log4perl::Layout::PatternLayout
-        log4perl.appender.SCREEN.layout.ConversionPattern = %d %p %m %n
-    );
-    Log::Log4perl::init(\$log_conf);
-    my $logger = Log::Log4perl->get_logger();
-
-    $logger->info("Starting pSSOd.");
+    $log->info("Starting pSSOd.");
 
     my $socket = new IO::Socket::INET (
-        LocalHost => SSOD_TCP_HOST,
-        LocalPort => SSOD_TCP_PORT,
+        LocalHost => $ssod_tcp_host,
+        LocalPort => $ssod_tcp_port,
         Proto => 'tcp',
         Listen => 5,
         Reuse => 1
@@ -295,7 +284,7 @@ else {
     my $client_socket = $socket->accept();
 
     my $error = handle_request $client_socket;
-    $logger->debug(sprintf("Error is %d", $error));
+    $log->debug(sprintf("Error is %d", $error));
 
     my $version_number = 0;
     my $message_type = 1;
