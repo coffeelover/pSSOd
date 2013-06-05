@@ -278,7 +278,7 @@ sub handle_request {
         return ERROR_DECRYPTING;
     }
 
-    $log->info(sprintf("Calling callback with user %s.", $username));
+    $log->debug(sprintf("Calling callback with user %s.", $username));
     return data_received_callback($username, $password);
 }
 
