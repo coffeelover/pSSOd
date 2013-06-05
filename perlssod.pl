@@ -16,7 +16,7 @@ use Crypt::DES;
 use MIME::Base64 qw(encode_base64);
 use Log::Log4perl;
 use Net::LDAP;
-use Net::LDAP::Entry;
+use Net::LDAP::Extension::SetPassword;
 use Config::File;
 
 # Check config every 60 secs
@@ -30,8 +30,13 @@ my $ssod_tcp_port=   $config->{'ssod_tcp_port'};
 my $ssod_debug_mode= $config->{'ssod_debug_mode'};
 my $ldap_uri=        $config->{'ldap_uri'};
 my $ldap_base=       $config->{'ldap_base'};
-my $ldap_rootdn=     $config->{'ldap_rootdn'};
-my $ldap_rootpw=     $config->{'ldap_rootpw'};
+my $ldap_binddn=     $config->{'ldap_binddn'};
+my $ldap_bindpw=     $config->{'ldap_bindpw'};
+
+my @ldap_servers= split(/, *?/, $ldap_uri);
+my $ldap_conn= Net::LDAP->new(\@ldap_servers) or die $log->error("Could not connect to LDAP @ldap_servers");
+   $ldap_conn->bind($ldap_binddn, password => $ldap_bindpw) or die $log->error("Could not bind to LDAP as $ldap_binddn");
+$log->debug("LDAP-Connection to @ldap_servers established");
 
 if (!$ssod_debug_mode) {
     use base qw(Net::Server::Fork);
@@ -74,10 +79,45 @@ use constant LAST_ERROR_NUMBER => 25;
 # is called when a new password change is notified
 #
 sub data_received_callback {
-    my ($username, $password) = @_;
+	my ($username, $password) = @_;
 
-    $log->info(sprintf("Inside callback with user %s and password %s.", $username, $password));
-    return 1;
+	$log->trace(sprintf("Inside callback with user %s and password %s.", $username, $password));
+	if(not defined($username) or 0 == length($username)) {
+		$log->error("Received empty username!");
+		return ERROR_BAD_USER_NAME;
+	}
+	if(not defined($password) or 0 == length($password)) {
+		$log->error("Received empty password!");
+		return ERROR_BAD_PASSWORD;
+	}
+
+	my $filter= "(uid=$username)";
+	my $user_search_result= $ldap_conn->search(
+		base      => $ldap_base,
+		filter    => $filter,
+		scope     => 'sub',
+	);
+	if ($user_search_result->is_error and not 32 == $user_search_result->code) {
+		$log->error("Error when searching for user $username: " . $user_search_result->error);
+		return ERROR_FILE_NOT_FOUND;
+	} elsif ( 32 == $user_search_result->code || $user_search_result->count == 0 ) {
+		$log->error("The user $username does not exist in LDAP");
+		return ERROR_NO_USER_ENTRY;
+	} elsif ($user_search_result->count>1) {
+		$log->error("The uid $username is not unique. Will not change Password!");
+		return ERROR_BAD_USER_NAME;
+	} else {
+		my $user_entry= $user_search_result->pop_entry;
+		my $password_change_result= $ldap_conn->set_password( user => $user_entry->dn, newpasswd => $password );
+		if ( $password_change_result->code() ) {
+			$log->error("Error when changing password for user $username: " . $password_change_result->error);
+			return ERROR_PASSWORD_NOT_UPDATED;
+		} else {
+			$log->info("Changed password for user $username");
+			return ERROR_SUCCESS;
+		}
+	}
+	return ERROR_WRITE_FAULT;
 }
 
 #
@@ -239,9 +279,7 @@ sub handle_request {
     }
 
     $log->info(sprintf("Calling callback with user %s.", $username));
-    my $res = data_received_callback($username, $password);
-    return ERROR_UPDATE_PASSWORD_FILE if (!$res);
-    return ERROR_SUCCESS;
+    return data_received_callback($username, $password);
 }
 
 #
@@ -299,4 +337,3 @@ else {
 
     $socket->close();
 }
-
